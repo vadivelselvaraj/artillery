@@ -62,6 +62,7 @@ HttpEngine.prototype.createScenario = function(scenarioSpec, ee) {
   }
 
   ensurePropertyIsAList(scenarioSpec, 'beforeRequest');
+  ensurePropertyIsAList(scenarioSpec, 'afterTemplateVarsSubstitution');
   ensurePropertyIsAList(scenarioSpec, 'afterResponse');
   ensurePropertyIsAList(scenarioSpec, 'beforeScenario');
   ensurePropertyIsAList(scenarioSpec, 'afterScenario');
@@ -511,6 +512,33 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
             return callback(err, context);
           });
         }
+
+      // Now run afterTemplateVarsSubstitution processors
+      let functionNames = _.concat(opts.afterTemplateVarsSubstitution || [], params.afterTemplateVarsSubstitution || []);
+      async.eachSeries(
+        functionNames,
+        function iteratee(functionName, next) {
+          let fn = template(functionName, context);
+          let processFunc = config.processor[fn];
+          if (!processFunc) {
+            processFunc = function(r, c, e, cb) { return cb(null); };
+            console.warn(`WARNING: custom function ${fn} could not be found`); // TODO: a 'warning' event
+          }
+          processFunc(requestParams, context, ee, function(err) {
+            if (err) {
+              return next(err);
+            }
+            return next(null);
+          });
+        }, function(err) {
+          if (err) {
+            debug(err);
+            ee.emit('error', err.code || err.message);
+            return callback(err, context);
+          }
+
+          return callback(null, context);
+        });
 
         request(requestParams, maybeCallback)
           .on('request', function(req) {
