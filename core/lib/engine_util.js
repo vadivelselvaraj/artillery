@@ -6,12 +6,12 @@
 
 const async = require('async');
 const debug = require('debug')('engine_util');
-const deepForEach = require('deep-for-each');
+const traverse = require('traverse');
 const esprima = require('esprima');
 const L = require('lodash');
 const vm = require('vm');
 const A = require('async');
-const jsonpath = require('jsonpath');
+const jsonpath = require('JSONPath');
 const cheerio = require('cheerio');
 const jitter = require('./jitter').jitter;
 
@@ -55,16 +55,10 @@ function createThink(requestSpec, opts) {
 // "count" can be an integer (negative or positive) or a string defining a range
 // like "1-15"
 function createLoopWithCount(count, steps, opts) {
+  let from = parseLoopCount(count).from;
+  let to = parseLoopCount(count).to;
+
   return function aLoop(context, callback) {
-
-    let count2 = count;
-    if (typeof count === 'string') {
-      count2 = template(count, context);
-    }
-
-    let from = parseLoopCount(count2).from;
-    let to = parseLoopCount(count2).to;
-
     let i = from;
     let newContext = context;
     let loopIndexVar = (opts && opts.loopValue) || '$loopCount';
@@ -73,7 +67,7 @@ function createLoopWithCount(count, steps, opts) {
     let abortEarly = false;
 
     let overValues = null;
-    let loopValue = i; // default to the current iteration of the loop, ie same as $loopCount
+    let loopValue = null;
     if (typeof opts.overValues !== 'undefined') {
       if (opts.overValues && typeof opts.overValues === 'object') {
         overValues = opts.overValues;
@@ -188,25 +182,22 @@ function isProbableEnough(obj) {
   return r < probability;
 }
 
-function template(o, context, inPlace) {
+function template(o, context) {
   let result;
+  if (typeof o === 'object') {
+    result = traverse(o).map(function(x) {
 
-  if (typeof o === 'undefined') {
-    return undefined;
-  }
-
-  if (o && (o.constructor === Object || o.constructor === Array)) {
-    if (!inPlace) {
-      result = L.cloneDeep(o);
-    } else {
-      result = o;
-    }
-    templateObjectOrArray(result, context);
-  } else if (typeof o === 'string') {
+      if (typeof x === 'string') {
+        this.update(template(x, context));
+      } else {
+        return x;
+      }
+    });
+  } else {
     if (!/{{/.test(o)) {
       return o;
     }
-    const funcCallRegex = /{{\s*(\$[A-Za-z0-9_]+\s*\(\s*[A-Za-z0-9_,\s]*\s*\))\s*}}/;
+    const funcCallRegex = /{{\s*(\$[A-Za-z0-9_]+\s*\(\s*.*\s*\))\s*}}/;
     let match = o.match(funcCallRegex);
     if (match) {
       // This looks like it could be a function call:
@@ -229,40 +220,12 @@ function template(o, context, inPlace) {
 
       result = renderVariables(o, context.vars);
     }
-  } else {
-    return o;
   }
-
   return result;
 }
 
-// Mutates the object in place
-function templateObjectOrArray(o, context) {
-  deepForEach(o, (value, key, subj, path) => {
-    const newPath = template(path, context, true);
-
-    let newValue;
-    if (value && (value.constructor !== Object && value.constructor !== Array)) {
-      newValue = template(value, context, true);
-    } else {
-      newValue = value;
-    }
-
-    debug(`path = ${path} ; value = ${JSON.stringify(value)} (${typeof value}) ; (subj type: ${subj.length ? 'list':'hash'}) ; newValue = ${JSON.stringify(newValue)} ; newPath = ${newPath}`);
-
-    // If path has changed, we need to unset the original path and
-    // explicitly walk down the new subtree from this path:
-    if (path !== newPath) {
-      L.unset(o, path);
-      newValue = template(value, context, true);
-    }
-
-    L.set(o, newPath, newValue);
-  });
-}
-
 function renderVariables (str, vars) {
-  const RX = /{{{?[\s$\w\.\[\]\'\"-]+}}}?/g;
+  const RX = /{{{?[\s$\w]+}}}?/g;
   let rxmatch;
   let result = str.substring(0, str.length);
 
@@ -277,7 +240,7 @@ function renderVariables (str, vars) {
     if (matches[0] === str) {
       // there's nothing else in the template but the variable
       const varName = str.replace(/{/g, '').replace(/}/g, '').trim();
-      return sanitiseValue(L.get(vars, varName));
+      return vars[varName] || '';
     }
   }
 
@@ -285,8 +248,7 @@ function renderVariables (str, vars) {
     let templateStr = result.match(RX)[0];
     const varName = templateStr.replace(/{/g, '').replace(/}/g, '').trim();
 
-    let varValue = L.get(vars, varName);
-
+    let varValue = vars[varName];
     if (typeof varValue === 'object') {
       varValue = JSON.stringify(varValue);
     }
@@ -380,7 +342,7 @@ function captureOrMatch(params, response, context, done) {
         if (spec.value) {
           // this is a match spec
           let expected = template(spec.value, context);
-          debug('match: %s, expected: %s, got: %s', expr, expected, extractedValue);
+          debug('match: %s, expected: %s, got: %o', expr, expected, extractedValue);
           if (extractedValue !== expected) {
             result.matches[expr] = {
               success: false,
@@ -390,7 +352,7 @@ function captureOrMatch(params, response, context, done) {
               strict: spec.strict
             };
           } else {
-            result.matches.expr = {
+            result.matches[expr] = {
               success: true,
               expected: expected,
               expression: expr
@@ -402,15 +364,15 @@ function captureOrMatch(params, response, context, done) {
 
         if (spec.as) {
           // this is a capture
-          debug('capture: %s = %s', spec.as, extractedValue);
+          debug('capture: %s = %o', spec.as, extractedValue);
           result.captures[spec.as] = extractedValue;
           if (spec.transform) {
             let transformedValue = evil(
               result.captures,
               spec.transform);
 
-            debug('transform: %s = %s', spec.as, result.captures[spec.as]);
             result.captures[spec.as] = transformedValue !== null ? transformedValue : extractedValue;
+            debug('transform: %s = %o', spec.as, result.captures[spec.as]);
           }
         }
 
@@ -497,18 +459,7 @@ function dummyParser(body, callback) {
 
 // doc is a JSON object
 function extractJSONPath(doc, expr) {
-  // typeof null is 'object' hence the explicit check here
-  if (typeof doc !== 'object' || doc === null) {
-    return '';
-  }
-
-  let results;
-
-  try {
-    results = jsonpath.query(doc, expr);
-  } catch (queryErr) {
-    debug(queryErr);
-  }
+  let results = jsonpath.eval(doc, expr);
 
   if (!results) {
     return '';
@@ -595,9 +546,4 @@ function isXML(res) {
 
 function randomInt (low, high) {
   return Math.floor(Math.random() * (high - low + 1) + low);
-}
-
-function sanitiseValue (value) {
-  if (value === 0 || value === false) return value;
-  return value ? value : '';
 }

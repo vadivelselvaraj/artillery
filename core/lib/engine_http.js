@@ -7,6 +7,7 @@
 const async = require('async');
 const _ = require('lodash');
 const request = require('request');
+
 const debug = require('debug')('http');
 const debugRequests = require('debug')('http:request');
 const debugResponse = require('debug')('http:response');
@@ -17,36 +18,18 @@ const template = engineUtil.template;
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
-const qs = require('querystring');
 const filtrex = require('filtrex');
-const urlparse = require('url').parse;
 
 module.exports = HttpEngine;
-
-const DEFAULT_AGENT_OPTIONS = {
-  keepAlive: true,
-  keepAliveMsec: 1000
-};
 
 function HttpEngine(script) {
   this.config = script.config;
 
-  // If config.http.pool is set, create & reuse agents for all requests (with
-  // max sockets set). That's what we're done here.
-  // If config.http.pool is not set, we create new agents for each virtual user.
-  // That's done when the VU is initialized.
-
-  this.maxSockets = Infinity;
   if (script.config.http && script.config.http.pool) {
-    this.maxSockets = Number(script.config.http.pool);
+    this.pool = {
+      maxSockets: Number(script.config.http.pool)
+    };
   }
-  let agentOpts = Object.assign(DEFAULT_AGENT_OPTIONS, {
-    maxSockets: this.maxSockets,
-    maxFreeSockets: this.maxSockets
-  });
-
-  this._httpAgent = new http.Agent(agentOpts);
-  this._httpsAgent = new https.Agent(agentOpts);
 }
 
 HttpEngine.prototype.createScenario = function(scenarioSpec, ee) {
@@ -151,11 +134,8 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
     return function(context, callback) {
       let processFunc = self.config.processor[requestSpec.function];
       if (processFunc) {
-        return processFunc(context, ee, function(hookErr) {
-          if (hookErr) {
-            ee.emit('error', hookErr.code || hookErr.message);
-          }
-          return callback(hookErr, context);
+        return processFunc(context, ee, function() {
+          return callback(null, context);
         });
       } else {
         return process.nextTick(function () { callback(null, context); });
@@ -192,12 +172,12 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
       let cond;
       let result;
       try {
-        cond = _.has(config.processor, params.ifTrue) ?  config.processor[params.ifTrue]  : filtrex(params.ifTrue);
+        cond = filtrex(params.ifTrue);
         result = cond(context.vars);
       } catch (e) {
         result = 1; // if the expression is incorrect, just proceed // TODO: debug message
       }
-      if (!result) {
+      if (typeof result === 'undefined' || result === 0) {
         return process.nextTick(function () {
           callback(null, context);
         });
@@ -221,13 +201,8 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
     async.eachSeries(
       functionNames,
       function iteratee(functionName, next) {
-        let fn = template(functionName, context);
-        let processFunc = config.processor[fn];
-        if (!processFunc) {
-          processFunc = function(r, c, e, cb) { return cb(null); };
-          console.log(`WARNING: custom function ${fn} could not be found`); // TODO: a 'warning' event
-        }
 
+        let processFunc = config.processor[functionName];
         processFunc(requestParams, context, ee, function(err) {
           if (err) {
             return next(err);
@@ -253,34 +228,6 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
           // TODO: Warn if body is not a string or a buffer
         }
 
-        // add loop, name & uri elements to be interpolated
-        if (context.vars.$loopElement) {
-          context.vars.$loopElement = template(context.vars.$loopElement, context);
-        }
-        if (requestParams.name) {
-          requestParams.name = template(requestParams.name, context);
-        }
-        if (requestParams.uri) {
-          requestParams.uri = template(requestParams.uri, context);
-        }
-        if (requestParams.url) {
-          requestParams.url = template(requestParams.url, context);
-        }
-
-        // Follow all redirects by default unless specified otherwise
-        if (typeof requestParams.followRedirect === 'undefined') {
-          requestParams.followRedirect = true;
-          requestParams.followAllRedirects = true;
-        } else if (requestParams.followRedirect === false) {
-          requestParams.followAllRedirects = false;
-        }
-
-        // TODO: Use traverse on the entire flow instead
-
-        if (params.qs) {
-          requestParams.qs = template(params.qs, context);
-        }
-
         if (params.form) {
           requestParams.form = _.reduce(
             requestParams.form,
@@ -290,17 +237,6 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
             },
             {});
         }
-
-        if (params.formData) {
-          requestParams.formData = _.reduce(
-            requestParams.formData,
-            function(acc, v, k) {
-              acc[k] = template(v, context);
-              return acc;
-            },
-          {});
-        }
-
 
         // Assign default headers then overwrite as needed
         let defaultHeaders = lowcaseKeys(
@@ -343,16 +279,14 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
 
         requestParams.url = url;
 
-        if ((/^https/i).test(requestParams.url)) {
-          requestParams.agent = context._httpsAgent;
+        if (!self.pool) {
+          if ((/^https/i).test(requestParams.url)) {
+            requestParams.agent = context._httpsAgent;
+          } else {
+            requestParams.agent = context._httpAgent;
+          }
         } else {
-          requestParams.agent = context._httpAgent;
-        }
-
-        if (!requestParams.url.startsWith('http')) {
-          let err = new Error(`Invalid URL - ${requestParams.url}`);
-          ee.emit('error', err.message);
-          return callback(err, context);
+          requestParams.pool = self.pool;
         }
 
         function requestCallback(err, res, body) {
@@ -366,13 +300,6 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
               method: requestParams.method,
               headers: requestParams.headers
             };
-
-            if (context._jar._jar && typeof context._jar._jar.getCookieStringSync === 'function') {
-              requestInfo = Object.assign(requestInfo, {
-                cookie: context._jar._jar.getCookieStringSync(requestParams.url)
-              });
-            }
-
             if (requestParams.json && typeof requestParams.json !== 'boolean') {
               requestInfo.json = requestParams.json;
             }
@@ -384,25 +311,12 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
                 requestInfo.body = requestParams.body;
               } else {
                 // Only show the beginning of long bodies
-                if (typeof requestParams.body === 'string') {
-                  requestInfo.body = requestParams.body.substring(0, 512);
-                  if (requestParams.body.length > 512) {
-                    requestInfo.body += ' ...';
-                  }
-                } else if (typeof requestParams.body === 'object')  {
-                  requestInfo.body = `< ${requestParams.body.constructor.name} >`;
-                } else {
-                  requestInfo.body = String(requestInfo.body);
+                requestInfo.body = requestParams.body.substring(0, 512);
+                if (requestParams.body.length > 512) {
+                  requestInfo.body += ' ...';
                 }
               }
             }
-
-            if (requestParams.qs) {
-              requestInfo.qs = qs.encode(
-                Object.assign(
-                  qs.parse(urlparse(requestParams.url).query), requestParams.qs));
-            }
-
             debug('request: %s', JSON.stringify(requestInfo, null, 2));
           }
 
@@ -422,25 +336,28 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
                 });
               }
 
-              if (Object.keys(result.matches).length > 0 ||
-                  Object.keys(result.captures).length > 0) {
-
-                debug('captures and matches:');
-                debug(result.matches);
-                debug(result.captures);
-              }
+              debug('captures and matches:');
+              debug(result.matches);
+              debug(result.captures);
 
               // match and capture are strict by default:
-              let haveFailedMatches = _.some(result.matches, function(v, k) {
-                return !v.success && v.strict !== false;
-              });
+              const failedMatches = _.keys(result.matches).filter(function(expression) {
+                const match = result.matches[expression]
+                return !match.success && match.strict !== false;
+              })
+              let haveFailedMatches = failedMatches.length > 0;
 
-              let haveFailedCaptures = _.some(result.captures, function(v, k) {
-                return v === '';
+              let failedCaptures = _.keys(result.captures).filter(function(expression) {
+                return result.captures[expression] === '';
               });
+              let haveFailedCaptures = failedCaptures.length > 0;
 
               if (haveFailedMatches || haveFailedCaptures) {
-                // TODO: Emit the details of each failed capture/match
+                failedMatches.forEach(expression => {
+                  const match = result.matches[expression]
+                  ee.emit('error', `Failed match: expected=${match.expected} got=${match.got} expression=${expression}`)
+                })
+                failedCaptures.forEach(expression => ee.emit('error', `Failed capture: expression=${expression}`))
               } else {
                 _.each(result.matches, function(v, k) {
                   ee.emit('match', v.success, {
@@ -452,7 +369,7 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
                 });
 
                 _.each(result.captures, function(v, k) {
-                  _.set(context.vars, k, v);
+                  context.vars[k] = v;
                 });
               }
 
@@ -461,14 +378,7 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
               async.eachSeries(
                 functionNames,
                 function iteratee(functionName, next) {
-                  let fn = template(functionName, context);
-                  let processFunc = config.processor[fn];
-                  if (!processFunc) {
-                    // TODO: DRY - #223
-                    processFunc = function(r, c, e, cb) { return cb(null); };
-                    console.log(`WARNING: custom function ${fn} could not be found`); // TODO: a 'warning' event
-
-                  }
+                  let processFunc = config.processor[functionName];
                   processFunc(requestParams, res, context, ee, function(err) {
                     if (err) {
                       return next(err);
@@ -498,7 +408,7 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
         if (typeof requestParams.capture === 'object' ||
             typeof requestParams.match === 'object' ||
             requestParams.afterResponse ||
-            (typeof opts.afterResponse === 'object' && opts.afterResponse.length > 0) ||
+            opts.afterResponse ||
             process.env.DEBUG) {
           maybeCallback = requestCallback;
         }
@@ -513,36 +423,37 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
           });
         }
 
-      // Now run afterTemplateVarsSubstitution processors
-      let functionNames = _.concat(opts.afterTemplateVarsSubstitution || [], params.afterTemplateVarsSubstitution || []);
-      async.eachSeries(
-        functionNames,
-        function iteratee(functionName, next) {
-          let fn = template(functionName, context);
-          let processFunc = config.processor[fn];
-          if (!processFunc) {
-            processFunc = function(r, c, e, cb) { return cb(null); };
-            console.warn(`WARNING: custom function ${fn} could not be found`); // TODO: a 'warning' event
-          }
-          processFunc(requestParams, context, ee, function(err) {
-            if (err) {
-              return next(err);
+        // Now run afterTemplateVarsSubstitution processors
+        let functionNames = _.concat(opts.afterTemplateVarsSubstitution || [], params.afterTemplateVarsSubstitution || []);
+        async.eachSeries(
+          functionNames,
+          function iteratee(functionName, next) {
+            let fn = template(functionName, context);
+            let processFunc = config.processor[fn];
+            if (!processFunc) {
+              processFunc = function(r, c, e, cb) { return cb(null); };
+              console.warn(`WARNING: custom function ${fn} could not be found`); // TODO: a 'warning' event
             }
-            return next(null);
-          });
-        }, function(err) {
-          if (err) {
-            debug(err);
-            ee.emit('error', err.code || err.message);
-            return callback(err, context);
-          }
+            processFunc(requestParams, context, ee, function(err) {
+              if (err) {
+                return next(err);
+              }
+              return next(null);
+            });
+          }, function(err) {
+            if (err) {
+              debug(err);
+              ee.emit('error', err.code || err.message);
+              return callback(err, context);
+            }
 
-          return callback(null, context);
-        });
+            return callback(null, context);
+          }
+        );
 
         request(requestParams, maybeCallback)
           .on('request', function(req) {
-            debugRequests('request start: %s', req.path);
+            debugRequests("request start: %s", req.path);
             ee.emit('request');
 
             const startedAt = process.hrtime();
@@ -551,7 +462,7 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
               let code = res.statusCode;
               const endedAt = process.hrtime(startedAt);
               let delta = (endedAt[0] * 1e9) + endedAt[1];
-              debugRequests('request end: %s', req.path);
+              debugRequests("request end: %s", req.path);
               ee.emit('response', delta, code, context._uid);
             });
           }).on('end', function() {
@@ -578,25 +489,30 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
 
 HttpEngine.prototype.compile = function compile(tasks, scenarioSpec, ee) {
   let self = this;
+  let config = this.config;
+  let tls = config.tls || {};
 
   return function scenario(initialContext, callback) {
     initialContext._successCount = 0;
 
     initialContext._jar = request.jar();
+    let keepAliveMsec = 1000;
+    let maxSockets = 1;
+    if (self.config.http && self.config.http.maxSockets) {
+      maxSockets = self.config.http.maxSockets;
+    }
+    if (!self.pool) {
+      let agentOpts = {
+        keepAlive: true,
+        keepAliveMsecs: keepAliveMsec,
+        maxSockets: maxSockets,
+        maxFreeSockets: maxSockets
+      };
 
-    if (self.config.http && typeof self.config.http.pool !== 'undefined') {
-      // Reuse common agents (created in the engine instance constructor)
-      initialContext._httpAgent = self._httpAgent;
-      initialContext._httpsAgent = self._httpsAgent;
-    } else {
-      // Create agents just for this VU
-      const agentOpts = Object.assign(DEFAULT_AGENT_OPTIONS, {
-        maxSockets: 1,
-        maxFreeSockets: 1
-      });
       initialContext._httpAgent = new http.Agent(agentOpts);
       initialContext._httpsAgent = new https.Agent(agentOpts);
     }
+
 
     let steps = _.flatten([
       function zero(cb) {
@@ -609,6 +525,14 @@ HttpEngine.prototype.compile = function compile(tasks, scenarioSpec, ee) {
     async.waterfall(
       steps,
       function scenarioWaterfallCb(err, context) {
+        // If the connection was refused we might not have a context
+        if (context && context._httpAgent) {
+          context._httpAgent.destroy();
+        }
+        if (context && context._httpsAgent) {
+          context._httpsAgent.destroy();
+        }
+
         if (err) {
           //ee.emit('error', err.message);
           return callback(err, context);

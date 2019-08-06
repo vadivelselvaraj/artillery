@@ -32,11 +32,7 @@ const schema = new JSCK.Draft4(require('./schemas/artillery_test_script.json'));
 module.exports = {
   runner: runner,
   validate: validate,
-  stats: Stats,
-  contextFuncs: {
-    $randomString,
-    $randomNumber
-  }
+  stats: Stats
 };
 
 function validate(script) {
@@ -44,7 +40,7 @@ function validate(script) {
   return validation;
 }
 
-async function runner(script, payload, options, callback) {
+function runner(script, payload, options, callback) {
   let opts = _.assign({
     periodicStats: script.config.statsInterval || 10,
     mode: script.config.mode || 'uniform'
@@ -125,14 +121,6 @@ async function runner(script, payload, options, callback) {
   );
 
   //
-  // compile and run before script
-  //
-  let contextVars;
-  if (script.before) {
-    contextVars = await handleBeforeRequests(script, runnableScript, runnerEngines, ee);
-  }
-
-  //
   // load plugins:
   //
   let runnerPlugins = [];
@@ -172,7 +160,7 @@ async function runner(script, payload, options, callback) {
     let pluginConfigScope = pluginConfig.scope || runnableScript.config.pluginsScope;
     let pluginPrefix = pluginConfigScope ? pluginConfigScope : 'artillery-plugin-';
     let requireString = pluginPrefix + pluginName;
-    let Plugin, plugin, pluginErr;
+    let Plugin, plugin;
 
     requirePaths.forEach(function(rp) {
       try {
@@ -188,21 +176,14 @@ async function runner(script, payload, options, callback) {
         }
       } catch (err) {
         debug(err);
-        pluginErr = err;
       }
     });
 
     if (!Plugin || !plugin) {
-      let msg;
-
-      if (pluginErr.code === 'MODULE_NOT_FOUND') {
-        msg = `WARNING: Plugin ${pluginName} specified but module ${requireString} could not be found (${pluginErr.code})`;
-      } else {
-        msg = `WARNING: Could not initialize plugin ${pluginName} (${pluginErr.message})`;
-      }
-
-      console.log(msg);
-
+      console.log(
+        'WARNING: plugin %s specified but module %s could not be loaded',
+        pluginName,
+        requireString);
       warnings.plugins[pluginName] = {
         message: 'Could not load'
       };
@@ -224,7 +205,7 @@ async function runner(script, payload, options, callback) {
         engines: runnerEngines
       };
       debug('run() with: %j', runnableScript);
-      run(runnableScript, ee, opts, runState, contextVars);
+      run(runnableScript, ee, opts, runState);
     };
 
     ee.stop = function (done) {
@@ -262,17 +243,13 @@ async function runner(script, payload, options, callback) {
   return promise;
 }
 
-function run(script, ee, options, runState, contextVars) {
+function run(script, ee, options, runState) {
   let intermediate = Stats.create();
   let aggregate = [];
 
   let phaser = createPhaser(script.config.phases);
-  phaser.on('arrival', function (spec) {
-    if (runState.pendingScenarios >= spec.maxVusers) {
-      intermediate.avoidedScenario();
-    } else {
-      runScenario(script, intermediate, runState, contextVars);
-    }
+  phaser.on('arrival', function() {
+    runScenario(script, intermediate, runState);
   });
   phaser.on('phaseStarted', function(spec) {
     ee.emit('phaseStarted', spec);
@@ -308,18 +285,17 @@ function run(script, ee, options, runState, contextVars) {
   const periodicStatsTimer = setInterval(sendStats, options.periodicStats * 1000);
 
   function sendStats() {
+    aggregate.push(intermediate.clone());
     intermediate._concurrency = runState.pendingScenarios;
     intermediate._pendingRequests = runState.pendingRequests;
     ee.emit('stats', intermediate.clone());
-    delete intermediate._entries;
-    aggregate.push(intermediate.clone());
     intermediate.reset();
   }
 
   phaser.run();
 }
 
-function runScenario(script, intermediate, runState, contextVars) {
+function runScenario(script, intermediate, runState) {
   const start = process.hrtime();
 
   //
@@ -327,33 +303,14 @@ function runScenario(script, intermediate, runState, contextVars) {
   //
   if (!runState.compiledScenarios) {
     _.each(script.scenarios, function(scenario) {
-      if (typeof scenario.weight === 'undefined') {
+      if (!scenario.weight) {
         scenario.weight = 1;
-      } else {
-        debug(`scenario ${scenario.name} weight = ${scenario.weight}`);
-        const variableValues = Object.assign(
-          datafileVariables(script),
-          inlineVariables(script),
-          { $processEnvironment: process.env });
-
-        const w = engineUtil.template(
-          scenario.weight,
-          { vars: variableValues });
-        scenario.weight = isNaN(parseInt(w)) ? 0 : parseInt(w);
-        debug(`scenario ${scenario.name} weight has been set to ${scenario.weight}`);
       }
     });
 
     runState.picker = wl(script.scenarios);
 
     runState.scenarioEvents = new EventEmitter();
-    runState.scenarioEvents.on('counter', function(name, value) {
-      intermediate.counter(name, value);
-    });
-    runState.scenarioEvents.on('histogram', function(name, value) {
-      intermediate.addCustomStat(name, value);
-    });
-    // TODO: Deprecate
     runState.scenarioEvents.on('customStat', function(stat) {
       intermediate.addCustomStat(stat.stat, stat.value);
     });
@@ -385,7 +342,7 @@ function runScenario(script, intermediate, runState, contextVars) {
     runState.compiledScenarios = _.map(
         script.scenarios,
         function(scenarioSpec) {
-          const name = scenarioSpec.engine || script.config.engine || 'http';
+          const name = scenarioSpec.engine || 'http';
           const engine = runState.engines.find((e) => e.__name === name);
           return engine.createScenario(scenarioSpec, runState.scenarioEvents);
         }
@@ -402,8 +359,7 @@ function runScenario(script, intermediate, runState, contextVars) {
   intermediate.newScenario(script.scenarios[i].name || i);
 
   const scenarioStartedAt = process.hrtime();
-  const scenarioContext = createContext(script, contextVars);
-
+  const scenarioContext = createContext(script);
   const finish = process.hrtime(start);
   const runScenarioDelta = (finish[0] * 1e9) + finish[1];
   debugPerf('runScenarioDelta: %s', Math.round(runScenarioDelta / 1e6 * 100) / 100);
@@ -420,24 +376,37 @@ function runScenario(script, intermediate, runState, contextVars) {
   });
 }
 
-function datafileVariables(script) {
-  let result = {};
+/**
+ * Create initial context for a scenario.
+ */
+function createContext(script) {
+  const INITIAL_CONTEXT = {
+    vars: {
+      target: script.config.target,
+      $environment: script._environment
+    },
+    funcs: {
+      $randomNumber: $randomNumber,
+      $randomString: $randomString
+    }
+  };
+  let result = _.cloneDeep(INITIAL_CONTEXT);
+
+  //
+  // variables from payloads
+  //
   if (script.config.payload) {
     _.each(script.config.payload, function(el) {
-
-      // If data = [] (i.e. the CSV file is empty, or only has headers and
-      // skipHeaders = true), then row could = undefined
-      let row = el.reader(el.data) || [];
+      let row = el.reader(el.data);
       _.each(el.fields, function(fieldName, j) {
-        result[fieldName] = row[j];
+        result.vars[fieldName] = row[j];
       });
     });
   }
-  return result;
-}
 
-function inlineVariables(script) {
-  let result = {};
+  //
+  // inline variables
+  //
   if (script.config.variables) {
     _.each(script.config.variables, function(v, k) {
       let val;
@@ -446,40 +415,9 @@ function inlineVariables(script) {
       } else {
         val = v;
       }
-      result[k] = val;
+      result.vars[k] = val;
     });
   }
-  return result;
-}
-
-/**
- * Create initial context for a scenario.
- */
-function createContext(script, contextVars) {
-  const INITIAL_CONTEXT = {
-    vars: Object.assign(
-      {
-        target: script.config.target,
-        $environment: script._environment,
-        $processEnvironment: process.env
-      },
-      contextVars || {}),
-    funcs: {
-      $randomNumber: $randomNumber,
-      $randomString: $randomString,
-      $template: input => engineUtil.template(input, { vars: result.vars })
-    }
-  };
-
-  let result = _.cloneDeep(INITIAL_CONTEXT);
-
-  // variables from payloads:
-  const variableValues1 = datafileVariables(script);
-  Object.assign(result.vars, variableValues1);
-  // inline variables:
-  const variableValues2 = inlineVariables(script);
-  Object.assign(result.vars, variableValues2);
-
   result._uid = uuid.v4();
   result.vars.$uuid = result._uid;
   return result;
@@ -494,29 +432,4 @@ function $randomNumber(min, max) {
 
 function $randomString(length) {
   return Math.random().toString(36).substr(2, length);
-}
-
-function handleBeforeRequests(script, runnableScript, runnerEngines, testEvents) {
-  let ee = new EventEmitter();
-  return new Promise(function(resolve, reject){
-    ee.on('request', function() {
-      testEvents.emit('beforeTestRequest');
-    });
-    ee.on('error', function(error) {
-      testEvents.emit('beforeTestError', error);
-    });
-
-    let name = runnableScript.before.engine || 'http';
-    let engine = runnerEngines.find((e) => e.__name === name);
-    let beforeTestScenario = engine.createScenario(runnableScript.before, ee);
-    let beforeTestContext = createContext(script);
-    beforeTestScenario(beforeTestContext, function(err, context) {
-      if (err) {
-        debug(err);
-        return reject(err);
-      } else {
-        return resolve(context.vars);
-      }
-    });
-  });
 }

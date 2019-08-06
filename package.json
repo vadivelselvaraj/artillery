@@ -2,7 +2,6 @@
   "_from": "git+https://github.com/Nordstrom/artillery.git#96552a4656ba7d1c32d8868754b1f1ab5299f8b8",
   "_id": "artillery@1.6.0-18",
   "_inBundle": false,
-  "_integrity": "",
   "_location": "/artillery",
   "_phantomChildren": {},
   "_requested": {
